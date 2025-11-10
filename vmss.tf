@@ -180,6 +180,21 @@ resource "azurerm_linux_virtual_machine_scale_set" "this" {
 
   custom_data = base64encode(local.user_data)
 
+  extension {
+    name                 = "ApplicationHealthExtension"
+    publisher            = "Microsoft.ManagedServices"
+    type                 = "ApplicationHealthLinux"
+    type_handler_version = "2.0"
+    
+    settings = jsonencode({
+      protocol          = "tcp"
+      port              = 22
+      intervalInSeconds = 5
+      numberOfProbes    = 3
+      gracePeriod       = 30
+    })
+  }
+
   scale_in {
     rule = "OldestVM"
   }

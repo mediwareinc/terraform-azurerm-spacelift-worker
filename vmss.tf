@@ -122,6 +122,15 @@ resource "azurerm_linux_virtual_machine_scale_set" "this" {
   }
 
   source_image_id = var.source_image_id
+  upgrade_mode = "Rolling"
+  rolling_upgrade_policy {
+    max_batch_instance_percent = 50
+    max_unhealthy_instance_percent = 50
+    max_unhealthy_upgraded_instance_percent = 50
+    pause_time_between_batches = "PT1M"
+    prioritize_unhealthy_instances_enabled = true
+    maximum_surge_instances_enabled = true
+    }
 
   dynamic "source_image_reference" {
     for_each = var.source_image_id == null ? [0] : []

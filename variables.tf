@@ -53,7 +53,7 @@ variable "name_prefix" {
 variable "overprovision" {
   type        = bool
   description = "Indicates whether to allow Azure to overprovision the number of VM replicas when adding VMs."
-  default     = true
+  default     = false
 }
 
 variable "resource_group" {

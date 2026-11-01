@@ -30,7 +30,25 @@ module "azure-worker" {
 }
 ```
 
+## Worker communication
+
+Workers receive work over HTTP long-polling. The module exports `SPACELIFT_WORKER_COMMS_PROTOCOL` and
+`SPACELIFT_WORKER_COMMS_URL` before `configuration`, so `configuration` can still override them.
+
+- `worker_comms_protocol` - `poll` (default) or `mqtt`. MQTT is a temporary fallback; Spacelift plans to retire it at the end of 2026.
+- `worker_comms_url` - defaults to the US SaaS endpoint, `https://app.us.spacelift.io`. Use `https://app.spacelift.io` for EU SaaS. Required when the protocol is `poll`.
+
+Changing either value changes the scale set's `custom_data`, which rolls every instance through the rolling upgrade.
+
+## OS disk
+
+`os_disk_storage_account_type` defaults to `StandardSSD_LRS`. Azure retires Standard HDD (`Standard_LRS`) OS disks on
+September 8, 2028. Changing this value replaces the scale set.
+
 ## Debugging
+
+The startup script downloads and verifies the launcher, then runs it as the `spacelift-launcher` systemd service, so the
+launcher gets SIGTERM when the scale set deletes or reimages an instance. Logs go to `/var/log/spacelift/`.
 
 The workers VM instances are designed to reboot when the launcher process exits by default. This allows them to recover from certain types of errors and reconnect to Spacelift.
 
@@ -41,6 +59,9 @@ Because of this, the module supports a `process_exit_behavior` variable that can
 - `Reboot` - causes the instance to restart (the default behavior).
 - `Shutdown` - causes the instance to shutdown.
 - `None` - takes no action, allowing you to connect to the instance and investigate issues.
+
+The same action runs if the startup script fails before the launcher starts. It is skipped when the VM is already
+shutting down, so Azure deletes, reimages and restarts power the VM off instead of rebooting it.
 
 ## Accepting Terms
 

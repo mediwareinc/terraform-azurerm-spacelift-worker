@@ -1,4 +1,12 @@
 locals {
+  # Null-safe so a missing URL surfaces as the VMSS precondition error below
+  # rather than a template interpolation error here.
+  worker_comms_url = var.worker_comms_url == null ? "" : var.worker_comms_url
+  worker_comms_configuration = join("\n", compact([
+    "export SPACELIFT_WORKER_COMMS_PROTOCOL=\"${var.worker_comms_protocol}\"",
+    var.worker_comms_protocol == "poll" ? "export SPACELIFT_WORKER_COMMS_URL=\"${local.worker_comms_url}\"" : null,
+  ]))
+
   exit_command_map = {
     "Reboot" : { command : "reboot", message : "Rebooting in 15 seconds" },
     "Shutdown" : { command : "poweroff", message : "Powering off in 15 seconds" }
@@ -9,6 +17,12 @@ echo "${local.exit_command_map[var.process_exit_behavior].message}" >> /var/log/
 sleep 15
 ${local.exit_command_map[var.process_exit_behavior].command}
   EOF
+
+  # Runs after the launcher exits. Skipped when the VM is already shutting down: Azure
+  # deletes, reimages and restarts send an ACPI power-off, and a reboot here turns that
+  # into an in-guest reboot, so Azure waits about 10 minutes and then hard-resets the VM.
+  # No $ in the command: the unit is written from an unquoted heredoc.
+  systemd_stop_post = var.process_exit_behavior == "None" ? "" : "ExecStopPost=+/bin/sh -c 'systemctl is-system-running | grep -q stopping || { sleep 15; ${local.exit_command_map[var.process_exit_behavior].command}; }'"
 
   worker_script_head = <<EOF
 #!/bin/bash
@@ -27,7 +41,20 @@ if [[ "$currentArch" != "x86_64" && "$currentArch" != "aarch64" ]]; then
   return 1
 fi
 
-baseURL="https://downloads.${var.domain_name}/spacelift-launcher"
+# Check if we're connecting to FedRAMP environment by decoding SPACELIFT_TOKEN
+fedrampSuffix=""
+if [[ -n "$SPACELIFT_TOKEN" ]]; then
+  # Decode the base64 token and extract broker endpoint
+  decoded_token=$(echo "$SPACELIFT_TOKEN" | base64 -d 2>/dev/null || echo "")
+  if [[ -n "$decoded_token" ]]; then
+    broker_endpoint=$(echo "$decoded_token" | jq -r '.broker.endpoint' 2>/dev/null || echo "")
+    if [[ "$broker_endpoint" == *".fedramp.spacelift.io" ]] || [[ "$broker_endpoint" == *".fedramp.spacelift.dev" ]]; then
+      fedrampSuffix="-fedramp"
+    fi
+  fi
+fi
+
+baseURL="https://downloads.${var.domain_name}/spacelift-launcher$fedrampSuffix"
 binaryURL=$(printf "%s-%s" "$baseURL" "$currentArch")
 shaSumURL=$(printf "%s-%s_%s" "$baseURL" "$currentArch" "SHA256SUMS")
 shaSumSigURL=$(printf "%s-%s_%s" "$baseURL" "$currentArch" "SHA256SUMS.sig")
@@ -38,7 +65,7 @@ if [[ "${var.perform_unattended_upgrade_on_boot}" == "true" ]]; then
   unattended-upgrade -d 1>>/var/log/spacelift/info.log 2>>/var/log/spacelift/error.log
 fi
 
-echo "Downloading Spacelift launcher" >> /var/log/spacelift/info.log
+echo "Downloading Spacelift launcher from $binaryURL" >> /var/log/spacelift/info.log
 curl "$binaryURL" --output /usr/bin/spacelift-launcher 2>>/var/log/spacelift/error.log
 echo "Importing public GPG key" >> /var/log/spacelift/info.log
 curl https://keys.openpgp.org/vks/v1/by-fingerprint/175FD97AD2358EFE02832978E302FB5AA29D88F7 | gpg --import 2>>/var/log/spacelift/error.log
@@ -66,26 +93,61 @@ fi
 echo "Making the Spacelift launcher executable" >> /var/log/spacelift/info.log
 chmod 755 /usr/bin/spacelift-launcher 2>>/var/log/spacelift/error.log
 
-# Get instance metadata
-echo "Retrieving Azure VM Name" >> /var/log/spacelift/info.log
-export SPACELIFT_METADATA_instance_id=$(curl -s -H Metadata:true --noproxy "*" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | jq -r ".compute.name")
-echo "Retrieving Azure VM Resource ID" >> /var/log/spacelift/info.log
-export SPACELIFT_METADATA_vm_resource_id=$(curl -s -H Metadata:true --noproxy "*" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | jq -r ".compute.resourceId")
-echo "Retrieving Azure VMSS Name" >> /var/log/spacelift/info.log
-export SPACELIFT_METADATA_vmss_name=$(curl -s -H Metadata:true --noproxy "*" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | jq -r ".compute.vmScaleSetName")
+# Get instance metadata from Azure IMDS
+echo "Retrieving Azure instance metadata" >> /var/log/spacelift/info.log
+IMDS_RESPONSE=$(curl -s -H Metadata:true --noproxy "*" "http://169.254.169.254/metadata/instance?api-version=2021-02-01")
+VM_NAME=$(echo "$IMDS_RESPONSE" | jq -r ".compute.name")
+export SPACELIFT_METADATA_instance_id=$(echo "$VM_NAME" | grep -oE '[0-9]+$')
+export SPACELIFT_METADATA_vm_resource_id=$(echo "$IMDS_RESPONSE" | jq -r ".compute.resourceId")
+export SPACELIFT_METADATA_vmss_name=$(echo "$IMDS_RESPONSE" | jq -r ".compute.vmScaleSetName")
+export SPACELIFT_METADATA_asg_id=$(echo "$IMDS_RESPONSE" | jq -r ".compute.vmScaleSetName")
 
-echo "Starting the Spacelift binary" >> /var/log/spacelift/info.log
-/usr/bin/spacelift-launcher 1>>/var/log/spacelift/info.log 2>>/var/log/spacelift/error.log
+# Write environment file for the systemd service.
+# Dump the full environment so the launcher inherits everything exported above,
+# including vars set via var.configuration (e.g. SPACELIFT_TOKEN, HTTP_PROXY).
+mkdir -p /etc/spacelift
+env > /etc/spacelift/env
+chmod 600 /etc/spacelift/env
+
+# Run the launcher as a systemd service so it gets SIGTERM when the VMSS deletes
+# or reimages the instance. A cloud-init per-boot script never does.
+cat > /etc/systemd/system/spacelift-launcher.service <<UNIT
+[Unit]
+Description=Spacelift Launcher
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/spacelift/env
+ExecStart=/usr/bin/spacelift-launcher
+${local.systemd_stop_post}
+KillMode=control-group
+TimeoutStopSec=30
+StandardOutput=append:/var/log/spacelift/info.log
+StandardError=append:/var/log/spacelift/error.log
+Restart=no
+UNIT
+
+systemctl daemon-reload
+systemctl start spacelift-launcher
+echo "Spacelift launcher started as systemd service" >> /var/log/spacelift/info.log
 )}
 
+# Call setup on its own line. Calling it as an if condition, as upstream
+# does, makes bash ignore set -e inside it.
 spacelift
-
+setupStatus=$?
+if [ $setupStatus -ne 0 ]; then
+  echo "Spacelift setup failed with status $setupStatus" >> /var/log/spacelift/error.log
 ${local.process_exit_command}
+fi
   EOF
 
   worker_script = base64encode(
     join("\n", [
       local.worker_script_head,
+      local.worker_comms_configuration,
       var.configuration,
       local.worker_script_tail,
     ])
@@ -122,15 +184,15 @@ resource "azurerm_linux_virtual_machine_scale_set" "this" {
   }
 
   source_image_id = var.source_image_id
-  upgrade_mode = "Rolling"
+  upgrade_mode    = "Rolling"
   rolling_upgrade_policy {
-    max_batch_instance_percent = 50
-    max_unhealthy_instance_percent = 50
+    max_batch_instance_percent              = 50
+    max_unhealthy_instance_percent          = 50
     max_unhealthy_upgraded_instance_percent = 50
-    pause_time_between_batches = "PT1M"
-    prioritize_unhealthy_instances_enabled = true
-    maximum_surge_instances_enabled = true
-    }
+    pause_time_between_batches              = "PT1M"
+    prioritize_unhealthy_instances_enabled  = true
+    maximum_surge_instances_enabled         = true
+  }
 
   dynamic "source_image_reference" {
     for_each = var.source_image_id == null ? [0] : []
@@ -153,7 +215,7 @@ resource "azurerm_linux_virtual_machine_scale_set" "this" {
 
   os_disk {
     caching              = "ReadWrite"
-    storage_account_type = "Standard_LRS"
+    storage_account_type = var.os_disk_storage_account_type
   }
 
   network_interface {
@@ -185,7 +247,7 @@ resource "azurerm_linux_virtual_machine_scale_set" "this" {
     publisher            = "Microsoft.ManagedServices"
     type                 = "ApplicationHealthLinux"
     type_handler_version = "2.0"
-    
+
     settings = jsonencode({
       protocol          = "tcp"
       port              = 22
@@ -197,6 +259,13 @@ resource "azurerm_linux_virtual_machine_scale_set" "this" {
 
   scale_in {
     rule = "OldestVM"
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.worker_comms_protocol != "poll" || var.worker_comms_url != null
+      error_message = "worker_comms_url must be set when worker_comms_protocol is \"poll\". Use https://app.us.spacelift.io for US SaaS, https://app.spacelift.io for EU SaaS, or the base URL of your self-hosted or FedRAMP Spacelift server."
+    }
   }
 
   tags = var.tags

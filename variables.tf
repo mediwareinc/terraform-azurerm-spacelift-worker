@@ -33,6 +33,28 @@ variable "domain_name" {
   default     = "spacelift.io"
 }
 
+variable "worker_comms_protocol" {
+  type        = string
+  description = "Transport used by workers to receive work. HTTP long-polling is the default; set to \"mqtt\" only as a temporary migration fallback."
+  default     = "poll"
+
+  validation {
+    condition     = contains(["poll", "mqtt"], var.worker_comms_protocol)
+    error_message = "worker_comms_protocol must be either \"poll\" or \"mqtt\"."
+  }
+}
+
+variable "worker_comms_url" {
+  type        = string
+  description = "Base URL of the Spacelift server used for HTTP long-polling. Required when worker_comms_protocol is \"poll\". Defaults to the US SaaS endpoint, our account's region. Use https://app.spacelift.io for EU SaaS, or the base URL of a self-hosted or FedRAMP Spacelift server."
+  default     = "https://app.us.spacelift.io"
+
+  validation {
+    condition     = var.worker_comms_url == null || can(regex("^https://[A-Za-z0-9.-]+(:[0-9]+)?/?$", var.worker_comms_url))
+    error_message = "worker_comms_url must be an HTTPS base URL containing only a scheme and host."
+  }
+}
+
 variable "identity_ids" {
   type        = list(string)
   description = "The list of user-assigned identities to associate with the VM instances."
@@ -109,6 +131,16 @@ variable "vmss_instances" {
   type        = number
   description = "The number of VM instances to create."
   default     = 2
+}
+
+variable "os_disk_storage_account_type" {
+  type        = string
+  description = "The storage account type for the OS disk. Changing it replaces the scale set. Standard_LRS (HDD) OS disks are retired by Azure on September 8, 2028."
+  default     = "StandardSSD_LRS"
+  validation {
+    condition     = contains(["Standard_LRS", "StandardSSD_LRS", "Premium_LRS", "StandardSSD_ZRS", "Premium_ZRS"], var.os_disk_storage_account_type)
+    error_message = "The os_disk_storage_account_type must be one of: Standard_LRS, StandardSSD_LRS, Premium_LRS, StandardSSD_ZRS, Premium_ZRS."
+  }
 }
 
 variable "vmss_sku" {
